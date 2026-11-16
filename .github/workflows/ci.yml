@@ -1,0 +1,274 @@
+name: CI
+
+on:
+  # No push trigger for main: every change reaches it as a squash-merged PR
+  # whose checks ran against an up-to-date main (required by the main
+  # ruleset), so the merge commit's tree was already verified.
+  push:
+    branches: [staging, "release/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+# One Poetry for every job, the version that wrote poetry.lock (see its
+# header). docker/bridge.Dockerfile pins the same version in its
+# POETRY_VERSION argument, so bump both together.
+env:
+  POETRY_VERSION: "2.4.1"
+  PIP_AUDIT_VERSION: "2.10.1"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The gates from docs/DEVELOPMENT.md section 7, against the same
+  # environment a plain local `poetry install` gives (main + dev, no
+  # hardware group).
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        id: setup-python
+        with:
+          python-version: "3.13"
+
+      - name: Install Poetry
+        run: pipx install "poetry==${POETRY_VERSION}"
+
+      # The virtualenv links to the interpreter it was built with, so the key
+      # carries the full Python version and a new patch release builds afresh.
+      - name: Set up Poetry cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pypoetry/virtualenvs
+          key: poetry-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('poetry.lock') }}
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      - name: Ruff check
+        run: poetry run ruff check src tests scripts
+
+      - name: Ruff format check
+        run: poetry run ruff format --check src tests scripts
+
+      - name: mypy
+        run: poetry run mypy src
+
+      - name: import-linter
+        run: poetry run lint-imports
+
+      # fail_under in pyproject.toml applies.
+      - name: pytest
+        run: poetry run pytest tests -q --cov=src --cov-report=term-missing
+
+  # Audits exactly what the bridge image ships: the main and hardware groups
+  # (docker/bridge.Dockerfile), in a venv of its own, so verify's cached venv
+  # never picks up the hardware group. The hardware group builds evdev from
+  # source, which the runner's toolchain covers.
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Install Poetry
+        run: pipx install "poetry==${POETRY_VERSION}"
+
+      - name: Install the image's dependencies
+        run: poetry install --no-interaction --no-root --only main,hardware
+
+      # pip itself is audited too, so it is upgraded inside the venv first.
+      - name: Dependency vulnerability audit
+        run: |
+          poetry run python -m pip install --upgrade pip "pip-audit==${PIP_AUDIT_VERSION}"
+          poetry run pip-audit
+
+  # Comments and docstrings must not reference local planning documents,
+  # see scripts/check_plan_refs.py and its allowlist.
+  plan-refs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check for planning labels
+        run: python3 scripts/check_plan_refs.py
+
+  # docker-compose.yml's default image tag must name the version in
+  # pyproject.toml, so a device that checks out a release tag pulls that
+  # release's images. scripts/bump_version.sh changes all three together.
+  version-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check pyproject/compose version parity
+        run: |
+          PROJECT_VERSION=$(grep -m1 '^version' pyproject.toml | sed -E 's/version = "(.*)"/\1/')
+          echo "pyproject.toml: $PROJECT_VERSION"
+          for service in bridge kiosk; do
+            COMPOSE_VERSION=$(grep -oE "glados-terminal/${service}:\\\$\{TERMINAL_VERSION:-v[^}]+\}" docker-compose.yml | sed -E 's/.*:-v(.*)\}/\1/')
+            echo "docker-compose.yml $service: $COMPOSE_VERSION"
+            if [ "$PROJECT_VERSION" != "$COMPOSE_VERSION" ]; then
+              echo "::error::docker-compose.yml's $service image defaults to v$COMPOSE_VERSION, pyproject.toml has $PROJECT_VERSION. Run scripts/bump_version.sh $PROJECT_VERSION."
+              exit 1
+            fi
+          done
+
+  # Secret scan over the full history of the checked-out ref. The history is
+  # small enough that a full scan stays fast, and it needs no special casing
+  # for new branches or force-pushes. Runs the pinned release binary
+  # directly, its checksum verified, instead of gitleaks-action.
+  gitleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$archive" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum --check
+          tar -xzf "$archive" gitleaks
+
+      - name: Scan
+        run: ./gitleaks git --redact --no-banner --verbose .
+
+  # Runs only for release branches, on their pushes and on their PR into
+  # main. Checks the branch name against the version files, the CHANGELOG
+  # section, that the tag is still free, and that the branch contains the
+  # current main, so the release-candidate images are built from exactly
+  # what the merge will tag. Skipped elsewhere, which counts as passing for
+  # the required check.
+  release-check:
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/')) ||
+      (github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The branch head itself, not the PR merge ref, which always
+          # contains main and would hide an outdated branch.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      # The branch name only has to be X.Y.Z here; which majors are allowed
+      # is check_release_version.sh's call.
+      - name: Check release branch
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          if [[ ! "$BRANCH" =~ ^release/([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::Release branch '$BRANCH' does not match release/X.Y.Z"
+            exit 1
+          fi
+          scripts/check_release_version.sh "${BASH_REMATCH[1]}"
+          git fetch origin main
+          if ! git merge-base --is-ancestor origin/main HEAD; then
+            echo "::error::$BRANCH does not contain the current main, update it from main first."
+            exit 1
+          fi
+
+  # Channel images for test kiosks. Runs only after the checks above pass on
+  # a push to `staging` (→ tag `staging`) or to a `release/**` branch
+  # (→ tag `release-candidate`), then moves that mutable GHCR tag to the new
+  # build. A test kiosk sets TERMINAL_VERSION to the channel name and follows
+  # it. These are never releases: release.yml publishes vX.Y.Z images when a
+  # release PR is merged. Built exactly like the release images, see
+  # release.yml's build job for the arm64 and cache choices.
+  #
+  # release-check only runs for release branches, so it may be skipped on
+  # `staging` but must succeed on `release/**`.
+  publish-channel-image:
+    needs: [verify, audit, plan-refs, version-parity, gitleaks, release-check]
+    if: >-
+      !cancelled() &&
+      github.event_name == 'push' && (github.ref == 'refs/heads/staging' || startsWith(github.ref, 'refs/heads/release/')) &&
+      needs.verify.result == 'success' &&
+      needs.audit.result == 'success' &&
+      needs.plan-refs.result == 'success' &&
+      needs.version-parity.result == 'success' &&
+      needs.gitleaks.result == 'success' &&
+      (needs.release-check.result == 'success' || (needs.release-check.result == 'skipped' && github.ref == 'refs/heads/staging'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        component: [bridge, kiosk]
+        include:
+          - component: bridge
+            target: prod
+            no_cache: false
+          - component: kiosk
+            no_cache: true
+    concurrency:
+      group: channel-${{ matrix.component }}-${{ github.ref == 'refs/heads/staging' && 'staging' || 'release-candidate' }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # OCI labels (org.opencontainers.image.revision = commit SHA, etc.)
+      # come from metadata-action, same as release images.
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          # The owner is lowercase already, which GHCR requires.
+          images: ghcr.io/${{ github.repository_owner }}/glados-terminal/${{ matrix.component }}
+          # GitHub does not recognise the custom license, so the label is set
+          # here instead of being derived from the repository.
+          labels: |
+            org.opencontainers.image.licenses=LicenseRef-DAL-1.0.0
+          tags: |
+            type=raw,value=staging,enable=${{ github.ref == 'refs/heads/staging' }}
+            type=raw,value=release-candidate,enable=${{ startsWith(github.ref, 'refs/heads/release/') }}
+
+      - name: Build and push channel image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./docker/${{ matrix.component }}.Dockerfile
+          target: ${{ matrix.target }}
+          platforms: linux/arm64
+          pull: true
+          no-cache: ${{ matrix.no_cache }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}

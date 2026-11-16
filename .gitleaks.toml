@@ -1,0 +1,28 @@
+# Repository config for gitleaks, read by CI's gitleaks job and the
+# pre-commit hook. It keeps the default rule set and only adds allowlists
+# for known false positives.
+
+[extend]
+useDefault = true
+
+# The identity store declares `self._key: Ed25519PrivateKey | None = None`.
+# The generic API key rule reads the type annotation after `_key:` as a
+# secret. Allowed only in that file and only for that annotation.
+[[allowlists]]
+description = "The identity store's key attribute annotation is not an API key"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^src/identity/store\.py$''']
+regexes = ['''Ed25519PrivateKey''']
+
+# The identity tests assert that a key they just generated starts with the
+# PKCS8 PEM header. The private key rule reads that assertion, together
+# with the lines after it, as a key. Allowed only in that file and only on
+# the line of that assertion.
+[[allowlists]]
+description = "The identity tests' PEM header assertion is not a private key"
+targetRules = ["private-key"]
+condition = "AND"
+paths = ['''^tests/test_identity\.py$''']
+regexTarget = "line"
+regexes = ['''assert pem\.startswith\(b"-----BEGIN PRIVATE KEY-----"\)''']

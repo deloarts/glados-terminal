@@ -1,0 +1,3 @@
+# Genuine hits for scripts/check_plan_refs.py, one `path::text` entry per line.
+# A flagged line is allowed when it sits in that file and contains the text.
+# Keep entries narrow: ordinary prose, never a reference to a plan.

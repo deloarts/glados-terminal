@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(poetry install)",
+      "Bash(poetry install --with hardware)",
+      "Bash(poetry lock)",
+      "Bash(poetry run pre-commit install)",
+      "Bash(poetry run pre-commit run --all-files)",
+      "Bash(poetry run pytest tests -q)",
+      "Bash(poetry run pytest tests -q --cov=src)",
+      "Bash(poetry run pytest tests/*)",
+      "Bash(poetry run ruff check src tests scripts)",
+      "Bash(poetry run ruff format src tests scripts)",
+      "Bash(poetry run ruff format --check src tests scripts)",
+      "Bash(poetry run mypy src)",
+      "Bash(poetry run lint-imports)",
+      "Bash(python3 scripts/check_plan_refs.py)",
+      "Bash(poetry run pip-audit)",
+      "Bash(gitleaks git --redact --no-banner --verbose .)",
+      "Bash(ENV_FILE=.env.dev poetry run uvicorn src.main:app --reload --port 8600)",
+      "Bash(docker compose -f docker-compose.yml -f docker-compose.build.yml build)",
+      "Bash(docker compose config)"
+    ]
+  }
+}
