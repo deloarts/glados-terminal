@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-16
+
 The first release of glados-terminal, the shop-floor kiosk terminal for [Glados](https://github.com/deloarts/glados). It works with Glados 0.1.x.
 
 ### What it does
