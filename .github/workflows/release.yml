@@ -98,7 +98,11 @@ jobs:
         env:
           MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
+          # The head branch is deleted on merge, so its commit is only reachable
+          # through the pull request's ref.
+          git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
           if ! git merge-base --is-ancestor "${MERGE_SHA}^" "$HEAD_SHA"; then
             echo "::error::The release branch was behind main when it was merged. Nothing was tagged. Validate main and use the workflow_dispatch recovery, or cut the next patch." >&2
             exit 1
