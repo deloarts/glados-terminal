@@ -1,0 +1,23 @@
+# ─────────────────────────────────────────────────────────────
+# GLADOS TERMINAL - local image builds
+#
+# Override for docker-compose.yml that builds both images from this
+# checkout instead of pulling them from GHCR:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml build
+#
+# The images get the same names as the pulled ones, for the host's own
+# architecture. Kiosk devices never use this file, they pull the arm64
+# images CI publishes (docs/INSTALLATION.md).
+# ─────────────────────────────────────────────────────────────
+services:
+  bridge:
+    build:
+      context: .
+      dockerfile: docker/bridge.Dockerfile
+      target: prod
+
+  kiosk:
+    build:
+      context: .
+      dockerfile: docker/kiosk.Dockerfile

@@ -1,0 +1,235 @@
+# Release: tag and publish a version when its release PR is merged.
+#
+# Merging a pull request from `release/X.Y.Z` into main is the release
+# action. This workflow then verifies the merge, tags the squash commit
+# vX.Y.Z, builds and pushes both linux/arm64 GHCR images, and creates the
+# GitHub Release from the matching CHANGELOG.md section. Tagging and
+# building happen in one run on purpose: a tag pushed with GITHUB_TOKEN does
+# not trigger other workflows, and a tag pushed by hand publishes nothing.
+#
+# workflow_dispatch (on main only) is the recovery path when the automatic
+# run failed after the merge: it tags the current main head if its version
+# files carry the given version and the tag is still free.
+#
+# Tags produced on ghcr.io/<owner>/glados-terminal/{bridge,kiosk}:
+#   - the exact tag (e.g. v0.2.0)
+#   - the major.minor tag (e.g. v0.2)
+#   - latest
+name: Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to tag on the current main head (X.Y.Z), only to recover a failed release run"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    # Only merged PRs from a release branch of this repository, never from a
+    # fork, and never a PR that was closed without merging.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       startsWith(github.event.pull_request.head.ref, 'release/'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.info.outputs.version }}
+      minor: ${{ steps.info.outputs.minor }}
+      sha: ${{ steps.info.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          fetch-depth: 0
+
+      # Only the X.Y.Z shape is checked here; which majors are allowed is
+      # check_release_version.sh's call, in the next step.
+      - name: Derive version
+        id: info
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+            if [[ "$REF" != "refs/heads/main" ]]; then
+              echo "::error::Run the recovery dispatch on main, not $REF" >&2
+              exit 1
+            fi
+            version="$INPUT_VERSION"
+          else
+            version="${HEAD_REF#release/}"
+          fi
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$version' is not an X.Y.Z version" >&2
+            exit 1
+          fi
+
+          {
+            echo "version=$version"
+            echo "minor=v${version%.*}"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check version files, CHANGELOG and tag
+        run: scripts/check_release_version.sh "${{ steps.info.outputs.version }}"
+
+      # A squash commit's only parent is main as it was right before the
+      # merge. If the release branch did not contain it, main had moved on
+      # and the merge would tag code the release candidate never ran.
+      - name: Check the release branch contained main
+        if: github.event_name == 'pull_request'
+        env:
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if ! git merge-base --is-ancestor "${MERGE_SHA}^" "$HEAD_SHA"; then
+            echo "::error::The release branch was behind main when it was merged. Nothing was tagged. Validate main and use the workflow_dispatch recovery, or cut the next patch." >&2
+            exit 1
+          fi
+
+  tag:
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+
+      - name: Create and push tag
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+          SHA: ${{ needs.guard.outputs.sha }}
+        run: |
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              tag -a "v$VERSION" -m "Release v$VERSION" "$SHA"
+          git push origin "v$VERSION"
+
+  # Kiosks are arm64 single-board computers, so both images are built for
+  # linux/arm64 only, emulated through QEMU on the hosted x64 runner.
+  # `pull: true` builds on the current base images. The kiosk image is built
+  # without the layer cache, so every release carries the Chromium that
+  # Debian ships at that moment; the bridge keeps its cache, which saves
+  # recompiling evdev under emulation.
+  build:
+    needs: [guard, tag]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        component: [bridge, kiosk]
+        include:
+          - component: bridge
+            target: prod
+            no_cache: false
+          - component: kiosk
+            no_cache: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: v${{ needs.guard.outputs.version }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          # The owner is lowercase already, which GHCR requires.
+          images: ghcr.io/${{ github.repository_owner }}/glados-terminal/${{ matrix.component }}
+          # GitHub does not recognise the custom license, so the label is set
+          # here instead of being derived from the repository.
+          labels: |
+            org.opencontainers.image.licenses=LicenseRef-DAL-1.0.0
+          tags: |
+            type=raw,value=v${{ needs.guard.outputs.version }}
+            type=raw,value=${{ needs.guard.outputs.minor }}
+            type=raw,value=latest
+
+      - name: Build and push image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./docker/${{ matrix.component }}.Dockerfile
+          target: ${{ matrix.target }}
+          platforms: linux/arm64
+          pull: true
+          no-cache: ${{ matrix.no_cache }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+
+  github-release:
+    needs: [guard, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: v${{ needs.guard.outputs.version }}
+
+      - name: Extract CHANGELOG section
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          awk -v ver="$VERSION" '
+            /^## \[/ {
+              if (found) exit
+              if (index($0, "[" ver "]") > 0) { found=1 }
+              next
+            }
+            found { print }
+          ' CHANGELOG.md > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            echo "(No CHANGELOG.md section found for $VERSION.)" > release_notes.md
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: v${{ needs.guard.outputs.version }}
+          name: v${{ needs.guard.outputs.version }}
+          body_path: release_notes.md

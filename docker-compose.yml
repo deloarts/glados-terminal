@@ -1,0 +1,152 @@
+# ─────────────────────────────────────────────────────────────
+# GLADOS TERMINAL - kiosk device compose
+#
+# Two containers, both pulled as linux/arm64 images from GHCR (built by
+# .github/workflows/release.yml, see docs/RELEASING.md): `bridge` owns the
+# local hardware and exposes it over a WebSocket; `kiosk` is the Chromium
+# display showing glados-frontend from the central server. Nothing here
+# hosts or builds the frontend itself -- KIOSK_URL points at wherever
+# glados-frontend is actually served from.
+#
+#   TERMINAL_VERSION  image tag pulled for both containers (default: the
+#                     version of this checkout, which scripts/bump_version.sh
+#                     writes below). Set it only to follow a channel on a
+#                     test kiosk: staging or release-candidate.
+#
+# docker-compose.build.yml adds the `build:` sections, to build both
+# images locally instead (docs/DEVELOPMENT.md section 6). This file has
+# none, so a kiosk never falls back to building the images itself when a
+# pull fails.
+#
+# `kiosk` runs on `network_mode: "service:bridge"` (shares bridge's
+# network namespace) rather than getting its own network: the frontend
+# page talks to the bridge over `ws://localhost:8600`, relying on
+# Chromium's mixed-content exemption for localhost (see the
+# `architecture` skill and CLAUDE.md) -- that only works if "localhost"
+# inside the kiosk container's network namespace IS the bridge's
+# namespace. Do not give kiosk its own `networks:`/`ports:` entry, it
+# would break this.
+# ─────────────────────────────────────────────────────────────
+name: glados-terminal
+
+services:
+
+  # ─── Bridge ─────────────────────────────────────────────────
+  bridge:
+    image: ghcr.io/deloarts/glados-terminal/bridge:${TERMINAL_VERSION:-v0.1.0}
+    restart: unless-stopped
+    # .env for a device installed with `docker compose`, stack.env for one
+    # installed as a Portainer stack, where Portainer writes the stack's
+    # environment variables to that file (docs/INSTALLATION.md section 13).
+    # Each is optional so either install works without the other's file;
+    # `required: false` needs Docker Compose 2.24 or newer.
+    env_file:
+      - path: .env
+        required: false
+      - path: stack.env
+        required: false
+    environment:
+      # Binds 0.0.0.0 INSIDE the container so the port mapping below can
+      # reach it at all -- the loopback-only guarantee (CLAUDE.md's hard
+      # rule) is enforced by that mapping, not by the bind address. See
+      # BRIDGE__HOST in src/infrastructure/config.py.
+      BRIDGE__HOST: 0.0.0.0
+    ports:
+      # Published to the HOST's loopback only. Never remove the
+      # "127.0.0.1:" prefix -- see the hard rule above.
+      - "127.0.0.1:8600:8600"
+    # Simplest robust way to hand the container hotplug-safe access to
+    # whichever RFID reader / scanner happen to be plugged in, without
+    # hand-enumerating /dev/input/eventN or /dev/ttyUSBn nodes that can
+    # renumber across reboots (see docs/INSTALLATION.md's by-id note).
+    # Deliberate tradeoff on a dedicated, single-purpose kiosk device;
+    # tighten to explicit `devices:` entries (one line per
+    # /dev/input/by-id/... and /dev/serial/by-id/... path) if this ever
+    # runs on shared/multi-tenant hardware.
+    privileged: true
+    volumes:
+      - /dev:/dev
+      # The device key pair (src/identity/store.py). A named volume, so it
+      # survives image updates and `docker compose down`; only
+      # `docker compose down -v` gives the device a new identity, which
+      # then has to be approved in Glados again.
+      - identity:/var/lib/glados-terminal
+      # The kiosk's runtime directory, for sway's IPC socket: POST /display
+      # switches the display through it (src/host/sway.py). Read-only is
+      # enough to connect to a socket.
+      - kiosk-runtime:/run/kiosk:ro
+      # The host's OS name and hostname for GET /device. The container's
+      # own /etc describes the bridge image, not the device. Long syntax,
+      # so a missing file fails the start instead of Docker creating a
+      # directory in the host's /etc.
+      - type: bind
+        source: /etc/os-release
+        target: /host/etc/os-release
+        read_only: true
+      - type: bind
+        source: /etc/hostname
+        target: /host/etc/hostname
+        read_only: true
+
+  # ─── Kiosk ──────────────────────────────────────────────────
+  kiosk:
+    image: ghcr.io/deloarts/glados-terminal/kiosk:${TERMINAL_VERSION:-v0.1.0}
+    restart: unless-stopped
+    # Shares the bridge container's network namespace -- see the header
+    # comment above, this is load-bearing, not incidental.
+    network_mode: "service:bridge"
+    environment:
+      KIOSK_URL: ${KIOSK_URL}
+      KIOSK_EXTRA_FLAGS: ${KIOSK_EXTRA_FLAGS:-}
+      KIOSK_CA_CERT: ${KIOSK_CA_CERT:-}
+      KIOSK_OUTPUT_MODE: ${KIOSK_OUTPUT_MODE:-}
+      KIOSK_OUTPUT_TRANSFORM: ${KIOSK_OUTPUT_TRANSFORM:-}
+      KIOSK_OUTPUT_SCALE: ${KIOSK_OUTPUT_SCALE:-}
+    # Not privileged. The container gets exactly the DRM/KMS nodes for the
+    # display and the evdev nodes for a touchscreen, if any. Both lists
+    # are taken when the container starts, so a touchscreen plugged in
+    # later needs `docker compose restart kiosk`. No group_add: the
+    # entrypoint reads the host GIDs of the DRM nodes at start time and
+    # hands them to the kiosk user, because those GIDs differ across
+    # DietPi images (docker/kiosk-entrypoint.sh).
+    devices:
+      - /dev/dri:/dev/dri
+      - /dev/input:/dev/input
+    security_opt:
+      # Nothing in this container may gain privileges through a setuid
+      # binary. The entrypoint only ever drops from root to the kiosk user.
+      - no-new-privileges:true
+      # Chromium runs as the kiosk user with its namespace sandbox, which
+      # creates user, PID and network namespaces. Docker's default seccomp
+      # profile only allows that with CAP_SYS_ADMIN. This profile is
+      # Docker's default (moby v27.5.1, profiles/seccomp/default.json) with
+      # two changes for containers without CAP_SYS_ADMIN: clone is allowed
+      # with namespace flags, and unshare is allowed. Everything else the
+      # default blocks (mount, setns, bpf, clone3 and so on) stays blocked.
+      # That is far less than `seccomp=unconfined`, CAP_SYS_ADMIN or
+      # `privileged: true`, and it keeps Chromium's renderers sandboxed
+      # instead of running them with --no-sandbox. Compose resolves the
+      # path against the project directory, i.e. this repo, wherever it
+      # is started from; a Portainer stack therefore has to be deployed
+      # from the Git repository, not pasted into the web editor.
+      - seccomp=./docker/kiosk-seccomp.json
+    volumes:
+      # Read-only udev database, so libinput in sway can enumerate the
+      # input devices above.
+      - /run/udev:/run/udev:ro
+      # XDG_RUNTIME_DIR of the kiosk user (uid 10001, docker/kiosk.Dockerfile),
+      # where sway puts its IPC socket. Shared with the bridge, which
+      # switches the display through that socket.
+      - kiosk-runtime:/run/user/10001
+    depends_on:
+      - bridge
+
+volumes:
+  identity:
+  # A runtime directory belongs in memory: tmpfs, created empty when the
+  # first of the two containers starts and gone once both have stopped.
+  kiosk-runtime:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "mode=0700,size=16m"
